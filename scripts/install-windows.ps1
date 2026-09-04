@@ -80,6 +80,36 @@ function Test-Command {
     $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+# Windows PowerShell 5.1 turns whatever a native command writes to stderr into
+# a NativeCommandError the moment it is redirected with 2>&1, and
+# $ErrorActionPreference = 'Stop' makes that terminating. uv, nvim and winget
+# all send ordinary notices to stderr, so run them with the preference relaxed
+# and judge success by exit code alone.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)] [string] $FilePath,
+        [string[]] $ArgumentList = @(),
+        [switch]   $Quiet,
+        [string]   $Indent = '      '
+    )
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $exitCode = 1
+    try {
+        $output = & $FilePath @ArgumentList 2>&1
+        if (Test-Path 'variable:LASTEXITCODE') { $exitCode = $LASTEXITCODE }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+
+    # 5.1 iterates once over $null, so the guard matters here.
+    if (-not $Quiet -and $null -ne $output) {
+        foreach ($line in $output) { Write-Host "$Indent$line" }
+    }
+    return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+}
+
 # --------------------------------------------------------------------------
 # winget packages
 # --------------------------------------------------------------------------
@@ -101,8 +131,10 @@ $Packages = @(
 
 function Test-WingetPackage {
     param([string] $Id)
-    $null = & winget list --id $Id --exact --accept-source-agreements 2>&1
-    return ($LASTEXITCODE -eq 0)
+    $result = Invoke-Native 'winget' @(
+        'list', '--id', $Id, '--exact', '--accept-source-agreements'
+    ) -Quiet
+    return ($result.ExitCode -eq 0)
 }
 
 function Install-WingetPackage {
@@ -369,13 +401,15 @@ function Invoke-NvimHeadless {
     $nvimArgs = @('--headless', $initLua) + $Commands + @('+qa')
 
     Write-Host "    nvim $Label ..."
-    & nvim @nvimArgs 2>&1 | ForEach-Object { Write-Host "      $_" }
-    if ($LASTEXITCODE -eq 0) {
+    # Lazy and Mason report progress on stderr, so this must go through
+    # Invoke-Native or 5.1 aborts the whole bootstrap.
+    $result = Invoke-Native 'nvim' $nvimArgs
+    if ($result.ExitCode -eq 0) {
         Write-Ok "${Label}: done"
         Add-Result $Label 'done'
     } else {
-        Write-Note "${Label}: nvim exited $LASTEXITCODE (usually harmless, check inside nvim)"
-        Add-Result $Label 'check' "exit $LASTEXITCODE"
+        Write-Note "${Label}: nvim exited $($result.ExitCode) (usually harmless, check inside nvim)"
+        Add-Result $Label 'check' "exit $($result.ExitCode)"
     }
 }
 
@@ -398,7 +432,7 @@ if (-not $SkipPackages) {
     Update-SessionPath
     Write-Step 'Installing Python tooling with uv'
     if ((Test-Command 'uv') -and -not $DryRun) {
-        & uv tool update-shell 2>&1 | Out-Null
+        $null = Invoke-Native 'uv' @('tool', 'update-shell') -Quiet
         Update-SessionPath
     }
     foreach ($tool in @('ty', 'ruff')) { Install-UvTool $tool }
