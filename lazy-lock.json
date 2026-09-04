@@ -47,5 +47,5 @@
   "vim-be-good": { "branch": "master", "commit": "0ae3de14eb8efc6effe7704b5e46495e91931cc5" },
   "which-key.nvim": { "branch": "main", "commit": "3aab2147e74890957785941f0c1ad87d0a44c15a" },
   "yanky.nvim": { "branch": "main", "commit": "020c22d0cfa60358569e49d1d7b91630f175aef0" },
-  "yfp.nvim": { "branch": "main", "commit": "bd7e2ae590963ff5d37cf1b27c16bfb313a6649e" }
+  "yfp.nvim": { "branch": "main", "commit": "56c7294d2245179c3f1f583b3d457da82b2ceba0" }
 }
