@@ -44,12 +44,20 @@ Then open a new terminal and run `nvim`.
    Font and install it for the current user (no admin needed)
 4. Set the terminal font face -- Windows Terminal on Windows, GNOME Terminal on
    Linux, Terminal.app on MacOS. Any other terminal prints instructions instead.
-5. Run a headless `Lazy! install` + `Lazy! restore`, then `MasonInstall debugpy`
-   and the `markdown-preview` build, so the two items under
-   [Troubleshoot](#troubleshoot) never come up
+5. Run a headless `Lazy! install` + `Lazy! restore`, install `debugpy` through
+   Mason, and check the `markdown-preview` binary -- the two items under
+   [Troubleshoot](#troubleshoot)
 
 Plugins are pinned to `lazy-lock.json` rather than updated, so a fresh machine
 gets exactly the versions in this repo.
+
+Every headless Neovim step runs under a wall-clock limit (20 minutes by
+default). Without one a plugin build that waits on something interactive hangs
+the whole setup with nothing on screen to explain why -- which is exactly what
+`markdown-preview` does: its build opens a terminal buffer to run `install.cmd`,
+and under `--headless` there is no UI to drive it. The scripts therefore check
+for its prebuilt binary rather than trying to build it, and tell you the one
+command to run if it is missing.
 
 ### Useful flags
 
@@ -65,14 +73,24 @@ without changing anything.
 | `-SkipPluginSync` | `--skip-plugin-sync` | do not pre-install plugins |
 | `-NerdFont JetBrainsMono` | `--font JetBrainsMono` | use a different Nerd Font release |
 | `-FontFace '<family>'` | `--font-face '<family>'` | family name written into the terminal config |
+| `-StepTimeoutMinutes 20` | `--step-timeout 20` | wall-clock limit per headless Neovim step |
 
-Two notes on what the scripts touch:
+Three notes on what the scripts touch:
 
 - On Windows, the Windows Terminal `settings.json` is rewritten by
   `ConvertTo-Json`, which drops comments and reformatting. A timestamped
   `.vimcode-backup-*` copy is written next to it first.
 - On Linux, `~/.local/bin` is appended to `~/.bashrc` / `~/.zshrc` if it is not
   already on `PATH`. Pass `--no-path-edit` to skip that.
+- `Lazy! install` rewrites `lazy-lock.json` when it prunes entries for plugins
+  the config no longer references. That is a tracked file, so check `git diff`
+  after a bootstrap run.
+
+Fonts already installed are left alone. Windows loads registered per-user fonts
+at logon and keeps the files open, so an installed `.otf` cannot be overwritten
+-- and does not need to be. The script compares hashes and skips what already
+matches, which is why re-running it is safe. (Logging out does not release
+those handles; the fonts are simply loaded again at the next logon.)
 
 ----
 
@@ -103,6 +121,12 @@ Note that these additional packages should be installed FIRST, before starting n
 NeoVim itself must be `0.11.2` or newer (LazyVim's floor). This matters on
 Linux, where the distro package is usually older -- `install-linux.sh` installs
 the official release tarball into `~/.local` instead.
+
+Python debugging needs a real `python` on `PATH`, because Mason shells out to it
+to build `debugpy`. On Windows the 0-byte Microsoft Store alias in `WindowsApps`
+does not count -- Mason reports `Unable to find python3 installation in PATH`
+even though `where python` finds something. `uv python install --default` gives
+you a real one.
 
 ### Windows
 

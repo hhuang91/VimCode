@@ -26,6 +26,10 @@
     Font family written into Windows Terminal. Defaults to the monospaced
     Nerd Font variant, which is the one terminals render best.
 
+.PARAMETER StepTimeoutMinutes
+    How long any single headless Neovim step may run before it is stopped.
+    Guards against a plugin build that blocks on something interactive.
+
 .PARAMETER DryRun
     Print what would happen without changing anything.
 
@@ -44,6 +48,7 @@ param(
     [string] $NerdFont        = 'ComicShannsMono',
     [string] $NerdFontVersion = 'v3.5.1',
     [string] $FontFace        = 'ComicShannsMono Nerd Font Mono',
+    [int]    $StepTimeoutMinutes = 20,
     [switch] $DryRun
 )
 
@@ -108,6 +113,64 @@ function Invoke-Native {
         foreach ($line in $output) { Write-Host "$Indent$line" }
     }
     return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+}
+
+# Start-Process joins ArgumentList with spaces and does no quoting of its own,
+# so an ex command like '+Lazy! install' would arrive as two arguments. Quote
+# each one the way the Windows CRT expects.
+function ConvertTo-NativeArgument {
+    param([string] $Value)
+    if ($Value -eq '') { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+# Same idea as Invoke-Native, but gives up after $TimeoutSeconds instead of
+# waiting forever. A plugin build that blocks on something interactive would
+# otherwise hang the whole setup with no output to explain why.
+function Invoke-NativeWithTimeout {
+    param(
+        [Parameter(Mandatory)] [string] $FilePath,
+        [string[]] $ArgumentList = @(),
+        [Parameter(Mandatory)] [int] $TimeoutSeconds,
+        [string] $Indent = '      '
+    )
+
+    $stdoutFile  = [System.IO.Path]::GetTempFileName()
+    $stderrFile  = [System.IO.Path]::GetTempFileName()
+    $commandLine = (($ArgumentList | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+
+    $timedOut = $false
+    $exitCode = 1
+    try {
+        $proc = Start-Process -FilePath $FilePath -ArgumentList $commandLine -NoNewWindow -PassThru `
+            -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+        # 5.1 leaves ExitCode empty unless the process handle is cached here.
+        $null = $proc.Handle
+        if ($proc.WaitForExit($TimeoutSeconds * 1000)) {
+            $proc.WaitForExit()
+            $exitCode = $proc.ExitCode
+        } else {
+            $timedOut = $true
+            try { $proc.Kill() } catch { }
+            $null = $proc.WaitForExit(5000)
+        }
+    } finally {
+        # The redirect handles linger for a moment after the process exits.
+        $output = @()
+        foreach ($file in @($stdoutFile, $stderrFile)) {
+            for ($attempt = 0; $attempt -lt 10; $attempt++) {
+                try { $output += @(Get-Content -Path $file -ErrorAction Stop); break }
+                catch { Start-Sleep -Milliseconds 100 }
+            }
+            Remove-Item $file -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    foreach ($line in $output) { if ($line) { Write-Host "$Indent$line" } }
+    return [pscustomobject]@{ ExitCode = $exitCode; TimedOut = $timedOut; Output = $output }
 }
 
 # --------------------------------------------------------------------------
@@ -234,7 +297,10 @@ function Install-NerdFont {
 
     Add-Type -AssemblyName System.Drawing
     $installed = 0
+    $current   = 0
+    $locked    = 0
     $families  = New-Object System.Collections.Generic.HashSet[string]
+    $fresh     = New-Object System.Collections.ArrayList
 
     Get-ChildItem -Path $work -Include '*.ttf', '*.otf' -Recurse | ForEach-Object {
         $src  = $_
@@ -252,24 +318,61 @@ function Install-NerdFont {
             # Family probing is cosmetic; never let it stop the install.
         }
 
-        Copy-Item -Path $src.FullName -Destination $dest -Force
+        # Windows loads registered per-user fonts at logon and holds the files
+        # open, so an already-installed font cannot be overwritten -- and does
+        # not need to be. Comparing hashes first makes a re-run a no-op instead
+        # of an IOException. (This is why logging out does not release them.)
+        $upToDate = $false
+        if (Test-Path $dest) {
+            try {
+                $upToDate = (Get-FileHash -Path $dest -Algorithm SHA256).Hash -eq
+                            (Get-FileHash -Path $src.FullName -Algorithm SHA256).Hash
+            } catch {
+                $upToDate = $false
+            }
+        }
+
+        if ($upToDate) {
+            $current++
+        } else {
+            try {
+                Copy-Item -Path $src.FullName -Destination $dest -Force
+                [void] $fresh.Add($dest)
+                $installed++
+            } catch [System.IO.IOException] {
+                # Open in another process and different from the copy already
+                # installed -- an older build of the same face. Keep what is
+                # there rather than aborting the whole run.
+                Write-Skip "$($src.Name): open elsewhere, keeping the installed copy"
+                $locked++
+            }
+        }
+
         Set-ItemProperty -Path $regKey -Name $entry -Value $dest -Type String
-        $installed++
     }
 
-    # Make the fonts usable without a logoff/logon cycle.
-    Register-FontsWithSession -Directory $fontDir
+    # Only the newly written files need loading; re-registering the rest is
+    # what puts a lock on them in the first place.
+    if ($fresh.Count -gt 0) {
+        Register-FontsWithSession -Files $fresh
+    }
 
-    Write-Ok "$installed font file(s) installed for the current user"
+    if ($installed -gt 0) { Write-Ok "$installed font file(s) installed for the current user" }
+    if ($current   -gt 0) { Write-Skip "$current font file(s) already up to date" }
+    if ($locked    -gt 0) { Write-Skip "$locked font file(s) left as they were (older build, still valid)" }
     if ($families.Count -gt 0) {
         Write-Ok "families available: $(($families | Sort-Object) -join ', ')"
     }
-    Add-Result "font $Name" 'installed' "$installed files"
+
+    # Locked files are not a failure: the face is installed and usable either
+    # way, just not at the exact build shipped in this release.
+    $status = if ($installed -gt 0) { 'installed' } else { 'present' }
+    Add-Result "font $Name" $status "$installed new, $($current + $locked) kept"
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function Register-FontsWithSession {
-    param([string] $Directory)
+    param([string[]] $Files)
 
     $signature = @"
 [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
@@ -283,8 +386,8 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wPa
         if (-not ('VimCode.FontApi' -as [type])) {
             Add-Type -MemberDefinition $signature -Namespace 'VimCode' -Name 'FontApi'
         }
-        Get-ChildItem -Path $Directory -Include '*.ttf', '*.otf' -Recurse | ForEach-Object {
-            [void] [VimCode.FontApi]::AddFontResourceW($_.FullName)
+        foreach ($file in $Files) {
+            [void] [VimCode.FontApi]::AddFontResourceW($file)
         }
         $result = [IntPtr]::Zero
         # HWND_BROADCAST = 0xffff, WM_FONTCHANGE = 0x001D, SMTO_ABORTIFHUNG = 0x0002
@@ -389,6 +492,48 @@ function Set-WindowsTerminalFont {
 # Neovim plugin bootstrap
 # --------------------------------------------------------------------------
 
+# Mason shells out to python to build debugpy. Windows ships 0-byte
+# app-execution aliases named python.exe that only open the Microsoft Store, so
+# "python is on PATH" is not enough -- it has to actually report a version.
+function Test-UsablePython {
+    foreach ($name in @('python', 'python3')) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if (-not $command -or -not $command.Source) { continue }
+        if ((Test-Path $command.Source) -and (Get-Item $command.Source).Length -eq 0) { continue }
+
+        $probe = Invoke-Native $command.Source @('--version') -Quiet
+        if ($probe.ExitCode -eq 0 -and (($probe.Output -join ' ') -match 'Python \d')) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# LazyVim's build step for markdown-preview calls mkdp#util#install(), which
+# opens an interactive terminal buffer to run install.cmd. Under --headless
+# there is no UI to drive it, so it sits there forever. Check for the prebuilt
+# binary instead and point at the manual fix when it is missing.
+function Test-MarkdownPreviewBinary {
+    $appDir = Join-Path $env:LOCALAPPDATA 'nvim-data\lazy\markdown-preview.nvim\app'
+    $binDir = Join-Path $appDir 'bin'
+
+    if (-not (Test-Path $appDir)) {
+        Write-Skip 'markdown-preview: plugin not installed, nothing to check'
+        Add-Result 'markdown-preview' 'skipped'
+        return
+    }
+
+    $binary = Get-ChildItem -Path $binDir -Filter 'markdown-preview-*' -ErrorAction SilentlyContinue
+    if ($binary) {
+        Write-Ok "markdown-preview: prebuilt binary present ($($binary[0].Name))"
+        Add-Result 'markdown-preview' 'present'
+    } else {
+        Write-Note 'markdown-preview: prebuilt binary missing'
+        Write-Note "  finish it by hand: cd '$appDir'; .\install.cmd"
+        Add-Result 'markdown-preview' 'check' 'run install.cmd'
+    }
+}
+
 function Invoke-NvimHeadless {
     param([string] $Label, [string[]] $Commands)
 
@@ -399,12 +544,17 @@ function Invoke-NvimHeadless {
     # opening the session layout (explorer + terminals) part-way through a
     # long headless run.
     $nvimArgs = @('--headless', $initLua) + $Commands + @('+qa')
+    $timeout  = $StepTimeoutMinutes * 60
 
-    Write-Host "    nvim $Label ..."
-    # Lazy and Mason report progress on stderr, so this must go through
-    # Invoke-Native or 5.1 aborts the whole bootstrap.
-    $result = Invoke-Native 'nvim' $nvimArgs
-    if ($result.ExitCode -eq 0) {
+    Write-Host "    nvim $Label (up to $StepTimeoutMinutes min) ..."
+    # Lazy and Mason report progress on stderr, so this must not be a plain
+    # redirected native call or 5.1 aborts the whole bootstrap.
+    $result = Invoke-NativeWithTimeout 'nvim' $nvimArgs $timeout
+    if ($result.TimedOut) {
+        Write-Note "${Label}: still running after $StepTimeoutMinutes min, stopped it"
+        Write-Note "  run this inside nvim to finish: $($Commands -join '  ')"
+        Add-Result $Label 'timed out' "$StepTimeoutMinutes min"
+    } elseif ($result.ExitCode -eq 0) {
         Write-Ok "${Label}: done"
         Add-Result $Label 'done'
     } else {
@@ -462,8 +612,15 @@ if (-not $SkipPluginSync -and -not $DryRun) {
         # instead of updating them and rewriting the committed lockfile.
         Invoke-NvimHeadless 'plugin install' @('+Lazy! install', '+Lazy! restore')
         # Pre-empts the two items in the README's troubleshooting section.
-        Invoke-NvimHeadless 'debugpy install' @('+MasonInstall debugpy')
-        Invoke-NvimHeadless 'markdown-preview build' @('+Lazy! build markdown-preview.nvim')
+        if (Test-UsablePython) {
+            Invoke-NvimHeadless 'debugpy install' @('+MasonInstall debugpy')
+        } else {
+            Write-Note 'debugpy: skipped, no usable Python on PATH'
+            Write-Note '  Mason needs a real python.exe; the Microsoft Store alias does not count'
+            Write-Note '  fix with: uv python install --default   (then reopen your shell)'
+            Add-Result 'debugpy install' 'skipped' 'no python'
+        }
+        Test-MarkdownPreviewBinary
     } else {
         Write-Note 'nvim is not on PATH yet -- reopen your shell and run: nvim'
     }

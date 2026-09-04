@@ -13,6 +13,7 @@
 #   --skip-font            skip the Nerd Font install
 #   --skip-terminal-font   install the font but leave the terminal config alone
 #   --skip-plugin-sync     skip the headless Neovim plugin bootstrap
+#   --step-timeout MIN     wall-clock limit per headless Neovim step (default 20)
 #   --font NAME            Nerd Font release to install (default ComicShannsMono)
 #   --font-version VER     Nerd Font release tag (default v3.5.1)
 #   --font-face NAME       family name written into the terminal config
@@ -28,6 +29,7 @@ SKIP_PACKAGES=0
 SKIP_FONT=0
 SKIP_TERMINAL_FONT=0
 SKIP_PLUGIN_SYNC=0
+STEP_TIMEOUT_MINUTES=20
 DRY_RUN=0
 NERD_FONT="ComicShannsMono"
 NERD_FONT_VERSION="v3.5.1"
@@ -42,11 +44,12 @@ while [ $# -gt 0 ]; do
     --skip-font)          SKIP_FONT=1 ;;
     --skip-terminal-font) SKIP_TERMINAL_FONT=1 ;;
     --skip-plugin-sync)   SKIP_PLUGIN_SYNC=1 ;;
+    --step-timeout)       STEP_TIMEOUT_MINUTES="$2"; shift ;;
     --dry-run)            DRY_RUN=1 ;;
     --font)               NERD_FONT="$2"; shift ;;
     --font-version)       NERD_FONT_VERSION="$2"; shift ;;
     --font-face)          FONT_FACE="$2"; shift ;;
-    -h|--help)            sed -n '3,20p' "$0"; exit 0 ;;
+    -h|--help)            sed -n '3,21p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -295,18 +298,89 @@ set_terminal_font() {
 # Neovim plugin bootstrap
 # --------------------------------------------------------------------------
 
+# Runs a command with a wall-clock limit. MacOS has no `timeout` unless
+# coreutils is installed, so fall back to a background watchdog. Returns 124 on
+# timeout, matching what `timeout` itself reports.
+run_with_timeout() {
+  local seconds="$1"; shift
+  local status
+
+  if have timeout; then
+    timeout "$seconds" "$@"
+    return $?
+  elif have gtimeout; then
+    gtimeout "$seconds" "$@"
+    return $?
+  fi
+
+  "$@" &
+  local pid=$!
+  ( sleep "$seconds"; kill -TERM "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  local watcher=$!
+  wait "$pid" 2>/dev/null
+  status=$?
+  kill "$watcher" 2>/dev/null
+  # 143 = 128 + SIGTERM, i.e. the watchdog fired.
+  [ "$status" -eq 143 ] && return 124
+  return $status
+}
+
 nvim_headless() {
   local label="$1"; shift
-  printf '    nvim %s ...\n' "$label"
+  local seconds=$((STEP_TIMEOUT_MINUTES * 60))
+  local status
+
+  printf '    nvim %s (up to %s min) ...\n' "$label" "$STEP_TIMEOUT_MINUTES"
   # The file argument makes argc() non-zero, which stops autocmds.lua from
   # opening the session layout (explorer + terminals) part-way through a
   # long headless run.
-  if nvim --headless "$CONFIG_DIR/init.lua" "$@" +qa 2>&1 | sed 's/^/      /'; then
+  run_with_timeout "$seconds" nvim --headless "$CONFIG_DIR/init.lua" "$@" +qa 2>&1 | sed 's/^/      /'
+  status=${PIPESTATUS[0]}
+
+  if [ "$status" -eq 124 ]; then
+    note "$label: still running after $STEP_TIMEOUT_MINUTES min, stopped it"
+    note "  run this inside nvim to finish: $*"
+    result "$label" "timed out"
+  elif [ "$status" -eq 0 ]; then
     ok "$label: done"
     result "$label" "done"
   else
-    note "$label: nvim exited non-zero (usually harmless, check inside nvim)"
+    note "$label: nvim exited $status (usually harmless, check inside nvim)"
     result "$label" "check"
+  fi
+}
+
+# Mason shells out to python to build debugpy.
+have_usable_python() {
+  local candidate
+  for candidate in python3 python; do
+    if have "$candidate" && "$candidate" --version >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# LazyVim's build step for markdown-preview calls mkdp#util#install(), which
+# opens an interactive terminal buffer to run install.sh. Under --headless
+# there is no UI to drive it, so it sits there forever. Check for the prebuilt
+# binary instead and point at the manual fix when it is missing.
+check_markdown_preview() {
+  local app_dir="${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy/markdown-preview.nvim/app"
+
+  if [ ! -d "$app_dir" ]; then
+    skip "markdown-preview: plugin not installed, nothing to check"
+    result "markdown-preview" "skipped"
+    return
+  fi
+
+  if ls "$app_dir/bin/markdown-preview-"* >/dev/null 2>&1; then
+    ok "markdown-preview: prebuilt binary present"
+    result "markdown-preview" "present"
+  else
+    note "markdown-preview: prebuilt binary missing"
+    note "  finish it by hand: cd '$app_dir' && ./install.sh"
+    result "markdown-preview" "check" "run install.sh"
   fi
 }
 
@@ -317,12 +391,19 @@ bootstrap_plugins() {
     result "plugin sync" "skipped" "no nvim"
     return
   fi
-  # install + restore, not sync: this pins plugins to lazy-lock.json instead
-  # of updating them and rewriting the committed lockfile.
+  # install + restore, not sync: this pins plugins to lazy-lock.json rather
+  # than updating them. Note that install still prunes entries for plugins the
+  # config no longer references.
   nvim_headless "plugin install" "+Lazy! install" "+Lazy! restore"
-  # Pre-empts the two items in the README's troubleshooting section.
-  nvim_headless "debugpy install" "+MasonInstall debugpy"
-  nvim_headless "markdown-preview build" "+Lazy! build markdown-preview.nvim"
+
+  if have_usable_python; then
+    nvim_headless "debugpy install" "+MasonInstall debugpy"
+  else
+    note "debugpy: skipped, no usable Python on PATH"
+    result "debugpy install" "skipped" "no python"
+  fi
+
+  check_markdown_preview
 }
 
 # --------------------------------------------------------------------------
