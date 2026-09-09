@@ -22,6 +22,10 @@
 .PARAMETER SkipPluginSync
     Do not run the headless Neovim plugin bootstrap at the end.
 
+.PARAMETER VerifyLock
+    Skip every install step and only report plugins whose checked-out
+    commit differs from lazy-lock.json. Exits non-zero when any differ.
+
 .PARAMETER FontFace
     Font family written into Windows Terminal. Defaults to the monospaced
     Nerd Font variant, which is the one terminals render best.
@@ -45,6 +49,7 @@ param(
     [switch] $SkipFont,
     [switch] $SkipTerminalFont,
     [switch] $SkipPluginSync,
+    [switch] $VerifyLock,
     [string] $NerdFont        = 'ComicShannsMono',
     [string] $NerdFontVersion = 'v3.5.1',
     [string] $FontFace        = 'ComicShannsMono Nerd Font Mono',
@@ -561,6 +566,99 @@ function Invoke-NvimHeadless {
         Write-Note "${Label}: nvim exited $($result.ExitCode) (usually harmless, check inside nvim)"
         Add-Result $Label 'check' "exit $($result.ExitCode)"
     }
+    return $result
+}
+
+# Every lazy.nvim manage command ends with Lock.update(), which rewrites
+# lazy-lock.json from whatever is checked out -- even when the run matched zero
+# plugins -- and prunes entries for anything the spec did not resolve. That file
+# is tracked, so take a byte copy first and put it back after every pass.
+# Deliberately no git here: the config directory may have been copied, not cloned.
+$script:LockPath     = $null
+$script:LockSnapshot = $null
+$script:LockBaseline = $null
+$script:LockTouched  = $false
+
+# Put the tracked pins back, quietly. This has to happen after *every* nvim
+# pass, not just at the end: a pass that rewrote the lockfile would otherwise
+# feed its own output to the next one, and `restore` would restore to the
+# commits `install` just recorded instead of the ones the repo ships.
+function Reset-LockfileFromSnapshot {
+    if (-not $script:LockSnapshot) { return }
+    $now = $null
+    if (Test-Path -LiteralPath $script:LockPath) {
+        $now = (Get-FileHash -LiteralPath $script:LockPath -Algorithm SHA256).Hash
+    }
+    if ($now -ne $script:LockBaseline) {
+        $script:LockTouched = $true
+        Copy-Item -LiteralPath $script:LockSnapshot -Destination $script:LockPath -Force
+    }
+}
+
+# A headless pass that cannot leak its lockfile rewrite into the next one.
+function Invoke-NvimPinned {
+    param([string] $Label, [string[]] $Commands)
+    $result = Invoke-NvimHeadless $Label $Commands
+    Reset-LockfileFromSnapshot
+    return $result
+}
+
+function Invoke-WithLockfileGuard {
+    param([Parameter(Mandatory)] [scriptblock] $Body)
+
+    $script:LockPath     = Join-Path (Split-Path -Parent $PSScriptRoot) 'lazy-lock.json'
+    $script:LockSnapshot = $null
+    $script:LockBaseline = $null
+    $script:LockTouched  = $false
+
+    if (Test-Path -LiteralPath $script:LockPath) {
+        $script:LockSnapshot = [System.IO.Path]::GetTempFileName()
+        Copy-Item -LiteralPath $script:LockPath -Destination $script:LockSnapshot -Force
+        # Get-FileHash behaves identically on 5.1 and 7, unlike
+        # Get-Content -Encoding Byte vs -AsByteStream.
+        $script:LockBaseline = (Get-FileHash -LiteralPath $script:LockPath -Algorithm SHA256).Hash
+    } else {
+        Write-Note 'lazy-lock.json: not found -- plugins will land on their latest commits'
+        Add-Result 'lazy-lock.json' 'missing'
+    }
+
+    try {
+        & $Body
+    } finally {
+        # finally, not a trailing statement: $ErrorActionPreference = 'Stop'
+        # would otherwise skip the restore on any exception.
+        if ($script:LockSnapshot) {
+            Reset-LockfileFromSnapshot
+            if ($script:LockTouched) {
+                Write-Note 'lazy-lock.json: lazy rewrote it during the run, tracked copy restored'
+                Write-Note "  the 'lockfile verify' output above says whether anything still differs"
+                Add-Result 'lazy-lock.json' 'restored'
+            } else {
+                Write-Ok 'lazy-lock.json: unchanged'
+                Add-Result 'lazy-lock.json' 'unchanged'
+            }
+            Remove-Item -LiteralPath $script:LockSnapshot -Force -ErrorAction SilentlyContinue
+            $script:LockSnapshot = $null
+        }
+    }
+}
+
+# Audit mode for -VerifyLock. report({exit=true}) makes nvim exit non-zero when
+# anything differs, so this maps that to a FAILED row rather than the softer
+# 'check' row Invoke-NvimHeadless writes for a generic non-zero exit.
+function Invoke-LockVerification {
+    Write-Step 'Verifying plugin commits against lazy-lock.json'
+    if (-not (Test-Command 'nvim')) {
+        Write-Note 'nvim is not on PATH yet -- reopen your shell and run: nvim'
+        Add-Result 'lockfile verify' 'skipped' 'no nvim'
+        return
+    }
+    $result = Invoke-NvimHeadless 'lockfile verify' @("+lua require('config.lockcheck').report({exit=true})")
+    if ($result -and $result.ExitCode -ne 0) {
+        Add-Result 'lockfile pins' 'FAILED' 'commits differ from lockfile'
+    } else {
+        Add-Result 'lockfile pins' 'ok'
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -570,6 +668,18 @@ function Invoke-NvimHeadless {
 Write-Host ''
 Write-Host '  VimCode setup -- Windows' -ForegroundColor Magenta
 if ($DryRun) { Write-Host '  (dry run: nothing will be changed)' -ForegroundColor Yellow }
+
+if ($VerifyLock) {
+    # An audit, not an install: report and stop before any step that changes
+    # this machine.
+    Update-SessionPath
+    Invoke-LockVerification
+    Write-Host ''
+    Write-Host '  Summary' -ForegroundColor Magenta
+    $script:Results | Format-Table -AutoSize
+    if ($script:Results | Where-Object { $_.Status -eq 'FAILED' }) { exit 1 }
+    exit 0
+}
 
 if (-not (Test-Command 'winget')) {
     throw 'winget was not found. Install "App Installer" from the Microsoft Store, then re-run.'
@@ -608,19 +718,38 @@ if (-not $SkipPluginSync -and -not $DryRun) {
     Update-SessionPath
     if (Test-Command 'nvim') {
         Write-Step 'Bootstrapping Neovim plugins (this takes a few minutes)'
-        # install + restore, not sync: this pins plugins to lazy-lock.json
-        # instead of updating them and rewriting the committed lockfile.
-        Invoke-NvimHeadless 'plugin install' @('+Lazy! install', '+Lazy! restore')
-        # Pre-empts the two items in the README's troubleshooting section.
-        if (Test-UsablePython) {
-            Invoke-NvimHeadless 'debugpy install' @('+MasonInstall debugpy')
-        } else {
-            Write-Note 'debugpy: skipped, no usable Python on PATH'
-            Write-Note '  Mason needs a real python.exe; the Microsoft Store alias does not count'
-            Write-Note '  fix with: uv python install --default   (then reopen your shell)'
-            Add-Result 'debugpy install' 'skipped' 'no python'
+        Invoke-WithLockfileGuard {
+            # Two nvim processes on purpose. Every manage command ends with
+            # Lock.update(), which rewrites lazy-lock.json AND mutates the
+            # in-memory copy that `restore` reads back through the cached
+            # Lock.load(). Run both in one process and `restore` restores to
+            # whatever `install` just recorded, so it can never correct a
+            # drifted plugin. A fresh process re-reads the file, which the
+            # guard keeps pristine.
+            #
+            # ':Lazy! install' is not used here: the bang sets `wait`, never
+            # `lockfile`, so its checkout targets remotes/origin/<branch> --
+            # the tip, not the pin.
+            $null = Invoke-NvimPinned 'plugin install' @(
+                "+lua require('lazy.manage').install({wait=true,lockfile=true,show=false})"
+            )
+            # ':Lazy! restore' is M.restore({wait=true}); restore's own defaults
+            # supply lockfile=true, and its pipeline fetches first, so it also
+            # repairs a machine whose plugins had already drifted.
+            $null = Invoke-NvimPinned 'plugin pin' @('+Lazy! restore')
+
+            # Pre-empts the two items in the README's troubleshooting section.
+            if (Test-UsablePython) {
+                $null = Invoke-NvimPinned 'debugpy install' @('+MasonInstall debugpy')
+            } else {
+                Write-Note 'debugpy: skipped, no usable Python on PATH'
+                Write-Note '  Mason needs a real python.exe; the Microsoft Store alias does not count'
+                Write-Note '  fix with: uv python install --default   (then reopen your shell)'
+                Add-Result 'debugpy install' 'skipped' 'no python'
+            }
+            Test-MarkdownPreviewBinary
+            $null = Invoke-NvimPinned 'lockfile verify' @('+LazyLockVerify')
         }
-        Test-MarkdownPreviewBinary
     } else {
         Write-Note 'nvim is not on PATH yet -- reopen your shell and run: nvim'
     }

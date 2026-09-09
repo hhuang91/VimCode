@@ -13,6 +13,7 @@
 #   --skip-font            skip the Nerd Font install
 #   --skip-terminal-font   install the font but leave the terminal config alone
 #   --skip-plugin-sync     skip the headless Neovim plugin bootstrap
+#   --verify-lock          only check plugin commits against lazy-lock.json
 #   --step-timeout MIN     wall-clock limit per headless Neovim step (default 20)
 #   --font NAME            Nerd Font release to install (default ComicShannsMono)
 #   --font-version VER     Nerd Font release tag (default v3.5.1)
@@ -29,6 +30,7 @@ SKIP_PACKAGES=0
 SKIP_FONT=0
 SKIP_TERMINAL_FONT=0
 SKIP_PLUGIN_SYNC=0
+VERIFY_LOCK=0
 STEP_TIMEOUT_MINUTES=20
 DRY_RUN=0
 NERD_FONT="ComicShannsMono"
@@ -44,12 +46,13 @@ while [ $# -gt 0 ]; do
     --skip-font)          SKIP_FONT=1 ;;
     --skip-terminal-font) SKIP_TERMINAL_FONT=1 ;;
     --skip-plugin-sync)   SKIP_PLUGIN_SYNC=1 ;;
+    --verify-lock)        VERIFY_LOCK=1 ;;
     --step-timeout)       STEP_TIMEOUT_MINUTES="$2"; shift ;;
     --dry-run)            DRY_RUN=1 ;;
     --font)               NERD_FONT="$2"; shift ;;
     --font-version)       NERD_FONT_VERSION="$2"; shift ;;
     --font-face)          FONT_FACE="$2"; shift ;;
-    -h|--help)            sed -n '3,21p' "$0"; exit 0 ;;
+    -h|--help)            sed -n '3,22p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -336,6 +339,7 @@ nvim_headless() {
   # long headless run.
   run_with_timeout "$seconds" nvim --headless "$CONFIG_DIR/init.lua" "$@" +qa 2>&1 | sed 's/^/      /'
   status=${PIPESTATUS[0]}
+  NVIM_HEADLESS_STATUS=$status
 
   if [ "$status" -eq 124 ]; then
     note "$label: still running after $STEP_TIMEOUT_MINUTES min, stopped it"
@@ -384,6 +388,81 @@ check_markdown_preview() {
   fi
 }
 
+# Every lazy.nvim manage command ends with Lock.update(), which rewrites
+# lazy-lock.json from whatever is checked out -- even when the run matched zero
+# plugins -- and prunes entries for anything the spec did not resolve. That file
+# is tracked, so take a byte copy first and put it back after every pass.
+# Deliberately no git here: the config directory may have been copied, not cloned.
+LOCKFILE="$CONFIG_DIR/lazy-lock.json"
+LOCK_SNAPSHOT=""
+LOCK_TOUCHED=0
+
+lock_snapshot() {
+  LOCK_SNAPSHOT=""
+  LOCK_TOUCHED=0
+  if [ ! -f "$LOCKFILE" ]; then
+    note "lazy-lock.json: not found -- plugins will land on their latest commits"
+    result "lazy-lock.json" "missing"
+    return 0
+  fi
+  LOCK_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/lazy-lock.XXXXXX")" || { LOCK_SNAPSHOT=""; return 0; }
+  cp "$LOCKFILE" "$LOCK_SNAPSHOT"
+}
+
+# Put the tracked pins back, quietly. This has to happen after *every* nvim
+# pass, not just at the end: a pass that rewrote the lockfile would otherwise
+# feed its own output to the next one, and `restore` would restore to the
+# commits `install` just recorded instead of the ones the repo ships.
+lock_reset() {
+  [ -n "$LOCK_SNAPSHOT" ] || return 0
+  cmp -s "$LOCK_SNAPSHOT" "$LOCKFILE" 2>/dev/null && return 0
+  LOCK_TOUCHED=1
+  cp "$LOCK_SNAPSHOT" "$LOCKFILE"
+}
+
+# Idempotent: called from the EXIT trap and again on the normal path.
+lock_restore() {
+  [ -n "$LOCK_SNAPSHOT" ] || return 0
+  lock_reset
+  if [ "$LOCK_TOUCHED" -eq 1 ]; then
+    note "lazy-lock.json: lazy rewrote it during the run, tracked copy restored"
+    note "  the 'lockfile verify' output above says whether anything still differs"
+    result "lazy-lock.json" "restored"
+  else
+    ok "lazy-lock.json: unchanged"
+    result "lazy-lock.json" "unchanged"
+  fi
+  rm -f "$LOCK_SNAPSHOT"
+  LOCK_SNAPSHOT=""
+}
+
+# A headless pass that cannot leak its lockfile rewrite into the next one.
+nvim_pinned() {
+  nvim_headless "$@"
+  lock_reset
+}
+
+# Audit mode for --verify-lock. report({exit=true}) makes nvim exit non-zero
+# when anything differs, which nvim_headless surfaces as NVIM_HEADLESS_STATUS.
+verify_lock() {
+  step "Verifying plugin commits against lazy-lock.json"
+  # Audit only: reach a brew-installed nvim without sourcing any shell rc file.
+  for d in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+    case ":$PATH:" in *":$d:"*) ;; *) [ -d "$d" ] && PATH="$d:$PATH" ;; esac
+  done
+  if ! have nvim; then
+    note "nvim is not on PATH yet -- reopen your shell, then run: nvim"
+    result "lockfile verify" "skipped" "no nvim"
+    return
+  fi
+  nvim_headless "lockfile verify" "+lua require('config.lockcheck').report({exit=true})"
+  if [ "${NVIM_HEADLESS_STATUS:-0}" -ne 0 ]; then
+    result "lockfile pins" "FAILED" "commits differ from lockfile"
+  else
+    result "lockfile pins" "ok"
+  fi
+}
+
 bootstrap_plugins() {
   step "Bootstrapping Neovim plugins (this takes a few minutes)"
   if ! have nvim; then
@@ -391,19 +470,39 @@ bootstrap_plugins() {
     result "plugin sync" "skipped" "no nvim"
     return
   fi
-  # install + restore, not sync: this pins plugins to lazy-lock.json rather
-  # than updating them. Note that install still prunes entries for plugins the
-  # config no longer references.
-  nvim_headless "plugin install" "+Lazy! install" "+Lazy! restore"
+
+  lock_snapshot
+  trap 'lock_restore' EXIT INT TERM
+
+  # Two nvim processes, with the pins put back in between. Every manage command
+  # ends with Lock.update(), which rewrites lazy-lock.json AND mutates the
+  # in-memory copy that `restore` reads back through the cached Lock.load().
+  # Run both in one process and `restore` restores to whatever `install` just
+  # recorded, so it can never pull a drifted plugin back to its pin.
+  #
+  # Pass 1 installs what is missing. ':Lazy! install' is not used here: the bang
+  # sets `wait`, never `lockfile`, so its checkout would target
+  # remotes/origin/<branch> -- the tip, not the pin.
+  nvim_pinned "plugin install" "+lua require('lazy.manage').install({wait=true,lockfile=true,show=false})"
+  # Pass 2 pins everything already on disk. ':Lazy! restore' is
+  # M.restore({wait=true}); restore's own defaults supply lockfile=true, and its
+  # pipeline fetches first, so this is what repairs a drifted machine. Nothing
+  # is missing by now, so no startup auto-install runs ahead of it to rewrite
+  # the lockfile it is about to read.
+  nvim_pinned "plugin pin" "+Lazy! restore"
 
   if have_usable_python; then
-    nvim_headless "debugpy install" "+MasonInstall debugpy"
+    nvim_pinned "debugpy install" "+MasonInstall debugpy"
   else
     note "debugpy: skipped, no usable Python on PATH"
     result "debugpy install" "skipped" "no python"
   fi
 
   check_markdown_preview
+  nvim_pinned "lockfile verify" "+LazyLockVerify"
+
+  lock_restore
+  trap - EXIT INT TERM
 }
 
 # --------------------------------------------------------------------------
@@ -417,6 +516,20 @@ fi
 
 printf '\n%s  VimCode setup -- macOS (%s)%s\n' "$C_HEAD" "$(uname -m)" "$C_OFF"
 [ "$DRY_RUN" -eq 1 ] && printf '%s  (dry run: nothing will be changed)%s\n' "$C_NOTE" "$C_OFF"
+
+# --verify-lock is an audit, not an install: report and stop before any step
+# that changes this machine.
+if [ "$VERIFY_LOCK" -eq 1 ]; then
+  verify_lock
+  printf '\n%s  Summary%s\n' "$C_HEAD" "$C_OFF"
+  if [ "${#RESULTS[@]}" -gt 0 ]; then
+    for line in "${RESULTS[@]}"; do
+      printf '    %-26s %-14s %s\n' "${line%%|*}" "$(echo "$line" | cut -d'|' -f2)" "${line##*|}"
+    done
+  fi
+  printf '\n'
+  exit $FAILED
+fi
 
 if [ "$SKIP_PACKAGES" -eq 0 ]; then
   ensure_xcode_clt
