@@ -50,10 +50,28 @@ vim.api.nvim_create_autocmd("User", {
   end,
 })
 --
+-- True when Neovim was launched from the directory its own executable lives in,
+-- e.g. the Start menu / desktop shortcut, whose working directory is the `bin/`
+-- folder next to nvim.exe. That means "just give me an editor", not a project.
+local function launched_from_nvim_bin()
+  local exe = vim.v.progpath
+  if exe == nil or exe == "" then
+    return false
+  end
+  local bin = vim.fs.normalize(vim.fs.dirname(exe))
+  local cwd = vim.fs.normalize(vim.fn.getcwd())
+  if vim.fn.has("win32") == 1 then
+    bin, cwd = bin:lower(), cwd:lower()
+  end
+  return cwd == bin
+end
+
 -- Run this if we open vim at cwd: restore the session if one exists,
--- otherwise just open the project layout.
+-- otherwise just open the project layout. Skipped when a file was given on the
+-- command line, inside a nested Neovim, or when launched from nvim's own bin
+-- directory -- those all want a plain editor.
 vim.defer_fn(function()
-  if vim.fn.argc() ~= 0 or vim.env.NVIM then
+  if vim.fn.argc() ~= 0 or vim.env.NVIM or launched_from_nvim_bin() then
     return
   end
   local persistence = require("persistence")

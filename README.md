@@ -74,6 +74,7 @@ without changing anything.
 | `-NerdFont JetBrainsMono` | `--font JetBrainsMono` | use a different Nerd Font release |
 | `-FontFace '<family>'` | `--font-face '<family>'` | family name written into the terminal config |
 | `-StepTimeoutMinutes 20` | `--step-timeout 20` | wall-clock limit per headless Neovim step |
+| `-VerifyLock` | `--verify-lock` | only check plugin commits against `lazy-lock.json` |
 
 Three notes on what the scripts touch:
 
@@ -82,15 +83,50 @@ Three notes on what the scripts touch:
   `.vimcode-backup-*` copy is written next to it first.
 - On Linux, `~/.local/bin` is appended to `~/.bashrc` / `~/.zshrc` if it is not
   already on `PATH`. Pass `--no-path-edit` to skip that.
-- `Lazy! install` rewrites `lazy-lock.json` when it prunes entries for plugins
-  the config no longer references. That is a tracked file, so check `git diff`
-  after a bootstrap run.
+- `lazy-lock.json` is tracked, and every lazy.nvim manage command rewrites it
+  through `Lock.update()` -- even a run that matched no plugins. The bootstrap
+  takes a byte copy first and puts it back, reporting `restored` in the summary
+  when lazy tried to change it. `:LazyLockVerify` names the plugins that
+  disagree.
 
 Fonts already installed are left alone. Windows loads registered per-user fonts
 at logon and keeps the files open, so an installed `.otf` cannot be overwritten
 -- and does not need to be. The script compares hashes and skips what already
 matches, which is why re-running it is safe. (Logging out does not release
 those handles; the fonts are simply loaded again at the next logon.)
+
+### Plugin versions
+
+Every plugin is pinned to the commit in `lazy-lock.json`, including lazy.nvim
+itself -- `lua/config/lazy.lua` reads its sha out of the lockfile and checks the
+bootstrap clone out to it instead of tracking the `stable` branch.
+
+A plain first `nvim` on a fresh clone already installs at the pinned commits:
+lazy.nvim's startup installer passes `lockfile = true`, so there is no need to
+wipe `nvim-data` and run `:Lazy restore` by hand. The bootstrap adds two things
+on top -- a `restore` pass in its own process, which repairs a machine whose
+plugins drifted earlier, and the snapshot guard described above.
+
+The two passes run as separate `nvim` invocations on purpose. `Lock.update()`
+mutates lazy.nvim's cached in-memory lockfile as well as the file on disk, so an
+`install` and a `restore` in the same process make `restore` restore to whatever
+`install` just recorded -- it can never pull a drifted plugin back to its pin.
+
+To audit a machine without installing anything:
+
+```powershell
+.\scripts\install-windows.ps1 -VerifyLock     # Windows
+./scripts/install-linux.sh --verify-lock      # Linux / MacOS
+```
+
+or `:LazyLockVerify` inside nvim. Both report four states: `drifted` (installed
+at another commit), `missing` (in the spec, not installed), `unlocked`
+(installed with no lockfile entry) and `orphaned` (lockfile entry for a plugin
+the config no longer references). The script form exits non-zero when anything
+differs.
+
+To move the pins deliberately: `:Lazy update`, then commit `lazy-lock.json`.
+The update checker is off, so nothing bumps a version behind your back.
 
 ----
 
