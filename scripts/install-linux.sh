@@ -427,6 +427,8 @@ set_terminal_font() {
   if ! have gsettings || ! gsettings list-schemas 2>/dev/null | grep -q '^org.gnome.Terminal.ProfilesList$'; then
     note "GNOME Terminal not detected -- set the font face by hand:"
     note "  $FONT_FACE"
+    note "  ptyxis: gsettings set org.gnome.Ptyxis use-system-font false"
+    note "          gsettings set org.gnome.Ptyxis font-name '$FONT_FACE 12'"
     note "  kitty: 'font_family $FONT_FACE'   alacritty: font.normal.family"
     note "  wezterm: wezterm.font('$FONT_FACE')   ghostty: 'font-family = $FONT_FACE'"
     result "terminal font" "skipped" "manual"
