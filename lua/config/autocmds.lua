@@ -14,6 +14,21 @@
 --   2. nvim
 --   3. <leader>qs  -- restore session
 
+-- The leftmost regular editing window: skips floats and Snacks-managed
+-- splits (explorer sidebar, terminals).
+local function main_window()
+  local main
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.api.nvim_win_get_config(win).relative == "" and not vim.w[win].snacks_win then
+      if not main or vim.api.nvim_win_get_position(win)[2] < vim.api.nvim_win_get_position(main)[2] then
+        main = win
+      end
+    end
+  end
+  return main
+end
+
+-- Layout: | explorer | terminal | main buffer |
 local function open_project_layout()
   local project_dir = vim.fn.getcwd()
   -- Open cwd explorer.
@@ -26,16 +41,23 @@ local function open_project_layout()
     end
   end
 
-  -- Open two bottom terminal panes.
-  -- These are plain Neovim terminal buffers, not persistent shell sessions.
+  -- Open the terminal as a column between the explorer and the main buffer by
+  -- splitting it off the left side of the main window. The window is remembered,
+  -- so hiding and re-showing the terminal (q, <C-/>) puts it back in the middle.
+  -- This is a plain Neovim terminal buffer, not a persistent shell session.
   Snacks.terminal.focus(nil, {
     cwd = project_dir,
     count = 1,
-  })
-
-  Snacks.terminal.focus(nil, {
-    cwd = project_dir,
-    count = 2,
+    win = {
+      position = "left",
+      relative = "win",
+      win = main_window(),
+      -- 35% of the whole screen. Measured against vim.o.columns, not the main
+      -- window, since the explorer may still be opening when this runs.
+      width = function()
+        return math.floor(vim.o.columns * 0.35)
+      end,
+    },
   })
 
   -- escape to normal mode
