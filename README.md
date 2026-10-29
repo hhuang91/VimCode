@@ -145,6 +145,37 @@ Then make sure to enable the font in terminals
 
 **for MacOS** Enter settings for terminal --> Profile --> Font
 
+**for Linux** there is no installer to double-click. Unzip the font files into
+your user font folder and rebuild the font cache (needs `unzip` and
+`fontconfig`):
+
+```bash
+mkdir -p ~/.local/share/fonts/ComicShannsMono
+curl -fsSL -o /tmp/ComicShannsMono.zip https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/ComicShannsMono.zip
+unzip -o /tmp/ComicShannsMono.zip '*.otf' -d ~/.local/share/fonts/ComicShannsMono
+fc-cache -f ~/.local/share/fonts
+fc-list | grep "ComicShannsMono Nerd Font Mono"   # should list the font
+```
+
+Then set the font in the terminal:
+
+- GNOME Terminal: menu --> Preferences --> pick your profile --> `Text` tab -->
+  tick `Custom font` and select the font
+- Ptyxis:
+
+  ```bash
+  gsettings set org.gnome.Ptyxis use-system-font false
+  gsettings set org.gnome.Ptyxis font-name 'ComicShannsMono Nerd Font Mono 12'
+  ```
+
+- kitty: `font_family ComicShannsMono Nerd Font Mono`
+- alacritty: `font.normal.family = "ComicShannsMono Nerd Font Mono"`
+- wezterm: `config.font = wezterm.font("ComicShannsMono Nerd Font Mono")`
+- ghostty: `font-family = ComicShannsMono Nerd Font Mono`
+
+Over SSH, the font is drawn by the terminal on the machine you are sitting at,
+so install it there (the Windows/MacOS steps above), not on the remote Linux box.
+
 The family to pick is `ComicShannsMono Nerd Font Mono`. The zip also contains
 `ComicShannsMono Nerd Font` (double-width icons) and
 `ComicShannsMono Nerd Font Propo` (proportional), which are not what you want in
