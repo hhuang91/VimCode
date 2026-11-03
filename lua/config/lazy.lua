@@ -69,6 +69,22 @@ if not (vim.uv or vim.loop).fs_stat(lazypath) then
 end
 vim.opt.rtp:prepend(lazypath)
 
+-- Language servers can ask a question through window/showMessageRequest --
+-- Copilot does when the signed-in account's subscription has ended. Under
+-- --headless the default handler's prompt waits for input that never comes,
+-- which hangs scripts/install-* with nothing on screen. Print the message and
+-- decline instead. Set before any plugin loads: copilot.lua captures whatever
+-- handler is installed here when it builds its client.
+if vim.list_contains(vim.v.argv, "--headless") then
+  vim.lsp.handlers["window/showMessageRequest"] = function(_, params, ctx)
+    local client = vim.lsp.get_client_by_id(ctx.client_id)
+    vim.api.nvim_echo({
+      { (client and client.name or "LSP") .. ": " .. params.message .. " (no UI, dismissed)", "WarningMsg" },
+    }, true, {})
+    return vim.NIL
+  end
+end
+
 require("lazy").setup({
   spec = {
     -- add LazyVim and import its plugins
