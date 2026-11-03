@@ -132,9 +132,39 @@ function ConvertTo-NativeArgument {
     return '"' + $escaped + '"'
 }
 
+# Follows a redirect file while the child is still writing it. The share
+# flags are what let this open alongside the handle the child holds.
+function Open-OutputTail {
+    param([string] $Path)
+    $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read, [System.IO.FileShare] 'ReadWrite, Delete')
+    return [pscustomobject]@{
+        Reader  = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+        Partial = ''
+        Lines   = New-Object System.Collections.Generic.List[string]
+    }
+}
+
+# Prints every complete line written since the last call. An unterminated
+# tail is held back until the rest of it arrives, or printed as-is on -Final.
+function Read-OutputTail {
+    param([psobject] $Tail, [string] $Indent, [switch] $Final)
+    $lines = ($Tail.Partial + $Tail.Reader.ReadToEnd()) -split '\r?\n'
+    $Tail.Partial = ''
+    if (-not $Final) {
+        $Tail.Partial = $lines[-1]
+        $lines = @($lines | Select-Object -First ($lines.Count - 1))
+    }
+    foreach ($line in $lines) {
+        $Tail.Lines.Add($line)
+        if ($line) { Write-Host "$Indent$line" }
+    }
+}
+
 # Same idea as Invoke-Native, but gives up after $TimeoutSeconds instead of
-# waiting forever. A plugin build that blocks on something interactive would
-# otherwise hang the whole setup with no output to explain why.
+# waiting forever, and echoes output as it arrives rather than at exit. A step
+# that blocks on something interactive then shows the prompt it is stuck on
+# instead of sitting silent until the timeout.
 function Invoke-NativeWithTimeout {
     param(
         [Parameter(Mandatory)] [string] $FilePath,
@@ -149,32 +179,39 @@ function Invoke-NativeWithTimeout {
 
     $timedOut = $false
     $exitCode = 1
+    $tails    = @()
     try {
         $proc = Start-Process -FilePath $FilePath -ArgumentList $commandLine -NoNewWindow -PassThru `
             -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
         # 5.1 leaves ExitCode empty unless the process handle is cached here.
         $null = $proc.Handle
-        if ($proc.WaitForExit($TimeoutSeconds * 1000)) {
+        $tails = @(@($stdoutFile, $stderrFile) | ForEach-Object { Open-OutputTail $_ })
+
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $proc.WaitForExit(500)) {
+            foreach ($tail in $tails) { Read-OutputTail $tail $Indent }
+            if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                $timedOut = $true
+                try { $proc.Kill() } catch { }
+                $null = $proc.WaitForExit(5000)
+                break
+            }
+        }
+        if (-not $timedOut) {
             $proc.WaitForExit()
             $exitCode = $proc.ExitCode
-        } else {
-            $timedOut = $true
-            try { $proc.Kill() } catch { }
-            $null = $proc.WaitForExit(5000)
         }
     } finally {
-        # The redirect handles linger for a moment after the process exits.
-        $output = @()
+        foreach ($tail in $tails) {
+            Read-OutputTail $tail $Indent -Final
+            $tail.Reader.Dispose()
+        }
         foreach ($file in @($stdoutFile, $stderrFile)) {
-            for ($attempt = 0; $attempt -lt 10; $attempt++) {
-                try { $output += @(Get-Content -Path $file -ErrorAction Stop); break }
-                catch { Start-Sleep -Milliseconds 100 }
-            }
             Remove-Item $file -Force -ErrorAction SilentlyContinue
         }
     }
 
-    foreach ($line in $output) { if ($line) { Write-Host "$Indent$line" } }
+    $output = @($tails | ForEach-Object { $_.Lines })
     return [pscustomobject]@{ ExitCode = $exitCode; TimedOut = $timedOut; Output = $output }
 }
 
