@@ -128,6 +128,14 @@ differs.
 To move the pins deliberately: `:Lazy update`, then commit `lazy-lock.json`.
 The update checker is off, so nothing bumps a version behind your back.
 
+To bring another machine up to date with this repo, use `:ConfigPull` rather
+than anything in `:Lazy` -- lazy.nvim manages the plugins, not this config, and
+its Sync/Update move plugins past their pins. `:ConfigPull` runs
+`git pull --ff-only` in the config directory and lists the new commits; then
+restart Neovim and run `:Lazy restore`. If an earlier Sync or Update left
+`lazy-lock.json` modified, the pull is refused or the restore would use those
+versions; `:ConfigPull!` discards local changes to that one file first.
+
 ----
 
 The rest of this README is the manual version of the same steps, for reference
