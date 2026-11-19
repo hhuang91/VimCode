@@ -314,7 +314,7 @@ install_lazygit() {
 }
 
 install_node() {
-  step "Installing Node.js (for Copilot and markdown-preview)"
+  step "Installing Node.js (for markdown-preview)"
   if have node; then
     skip "node $(node --version) already installed"
     result "node" "present" "$(node --version)"

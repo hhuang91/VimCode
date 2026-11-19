@@ -136,6 +136,49 @@ restart Neovim and run `:Lazy restore`. If an earlier Sync or Update left
 `lazy-lock.json` modified, the pull is refused or the restore would use those
 versions; `:ConfigPull!` discards local changes to that one file first.
 
+### Local AI completion
+
+Inline suggestions come from a model running on this machine:
+[llama.vim](https://github.com/ggml-org/llama.vim) talking to a
+[llama.cpp](https://github.com/ggml-org/llama.cpp) server. Nothing leaves the
+machine and there is no quota. It is optional, and the install scripts do not
+set it up -- without `llama-server` on `PATH` the plugin is skipped and the
+rest of the config is unaffected.
+
+```powershell
+winget install llama.cpp      # Windows
+brew install llama.cpp        # MacOS / Linux
+```
+
+That is all. Neovim starts `llama-server` in the background the first time it
+is needed (`lua/config/llamaserver.lua`) and turns suggestions on once it
+answers. The very first start downloads the model (Qwen2.5-Coder 7B, ~8 GB)
+into the Hugging Face cache, so suggestions take a few minutes to appear; after
+that it is a few seconds. The server outlives Neovim so every instance shares
+one loaded model, and it unloads the model after 30 idle minutes.
+
+| Key | Action |
+| --- | --- |
+| `<Tab>` | accept the whole suggestion (the completion menu wins if it is open) |
+| `<M-l>` | accept the current line |
+| `<M-w>` | accept the next word |
+| `<M-\>` | ask for a suggestion now |
+
+`:LlamaToggle` switches suggestions off and on for the session,
+`:LlamaServerStop` also kills the server to free its VRAM, and
+`:LlamaServerStart` brings it back. The server logs to `llama-server.log` in
+`:echo stdpath('state')`.
+
+Per-machine tuning stays out of the repo:
+
+- **Which GPU** -- with more than one (e.g. an eGPU next to an integrated one),
+  list them with `llama-server --list-devices` and set the environment variable
+  `LLAMA_ARG_DEVICE` to the one to use, e.g. `Vulkan0`.
+- **Which model** -- set `vim.g.llama_server_args` (a list of `llama-server`
+  arguments) before plugins load; the default is `--fim-qwen-7b-default`. Use
+  `--fim-qwen-3b-default` below 16 GB of VRAM, `--fim-qwen-1.5b-default` below
+  8 GB.
+
 ----
 
 The rest of this README is the manual version of the same steps, for reference
@@ -229,7 +272,7 @@ Needed by `lazy.nvim` to fetch plugins
 #### node.js
 
 ~~For support Lsp Mason installing Pyright~~
-NOT for lsp anymore (switched to ty), but for copilot and markdownpreview
+NOT for lsp anymore (switched to ty), but for markdownpreview
 
 `winget install OpenJS.NodeJS`
 
