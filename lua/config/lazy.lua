@@ -128,3 +128,10 @@ require("lazy").setup({
 vim.api.nvim_create_user_command("LazyLockVerify", function()
   require("config.lockcheck").report()
 end, { desc = "Report plugins whose checked-out commit differs from lazy-lock.json" })
+
+vim.api.nvim_create_user_command("ConfigPull", function(args)
+  require("config.configpull").pull({ discard_lock = args.bang })
+end, {
+  bang = true,
+  desc = "git pull --ff-only this config repo (! first discards local lazy-lock.json changes)",
+})
