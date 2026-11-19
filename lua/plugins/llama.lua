@@ -13,7 +13,16 @@ return {
     event = "VeryLazy",
     -- Machines without llama.cpp simply get no AI completion. `cond`, not
     -- `enabled`, so the plugin keeps its lazy-lock.json pin either way.
+    --
+    -- NVIM_NO_LLAMA is the opt-out for a machine that has llama.cpp installed
+    -- but should not run a model from the editor (no GPU, too little VRAM).
+    -- An environment variable because it is per-machine and so cannot live in
+    -- this repo. Any value except empty or "0" counts.
     cond = function()
+      local off = vim.env.NVIM_NO_LLAMA
+      if off and off ~= "" and off ~= "0" then
+        return false
+      end
       return vim.fn.executable("llama-server") == 1 and vim.fn.executable("curl") == 1
     end,
     init = function()

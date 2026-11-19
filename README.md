@@ -171,6 +171,10 @@ one loaded model, and it unloads the model after 30 idle minutes.
 
 Per-machine tuning stays out of the repo:
 
+- **Opting out** -- the only check is whether `llama-server` is on `PATH`, not
+  whether the machine can run the model. On one that has llama.cpp installed
+  but no suitable GPU, set the environment variable `NVIM_NO_LLAMA=1` and the
+  plugin is skipped: no server is started and nothing is downloaded.
 - **Which GPU** -- with more than one (e.g. an eGPU next to an integrated one),
   list them with `llama-server --list-devices` and set the environment variable
   `LLAMA_ARG_DEVICE` to the one to use, e.g. `Vulkan0`.
