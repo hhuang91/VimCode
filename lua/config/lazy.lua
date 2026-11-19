@@ -70,11 +70,11 @@ end
 vim.opt.rtp:prepend(lazypath)
 
 -- Language servers can ask a question through window/showMessageRequest --
--- Copilot does when the signed-in account's subscription has ended. Under
+-- Copilot did when the signed-in account's subscription had ended. Under
 -- --headless the default handler's prompt waits for input that never comes,
 -- which hangs scripts/install-* with nothing on screen. Print the message and
--- decline instead. Set before any plugin loads: copilot.lua captures whatever
--- handler is installed here when it builds its client.
+-- decline instead. Set before any plugin loads, since a client may capture
+-- whatever handler is installed here when it is built.
 if vim.list_contains(vim.v.argv, "--headless") then
   vim.lsp.handlers["window/showMessageRequest"] = function(_, params, ctx)
     local client = vim.lsp.get_client_by_id(ctx.client_id)
