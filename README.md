@@ -138,24 +138,49 @@ versions; `:ConfigPull!` discards local changes to that one file first.
 
 ### Local AI completion
 
-Inline suggestions come from a model running on this machine:
+Inline suggestions come from
 [llama.vim](https://github.com/ggml-org/llama.vim) talking to a
-[llama.cpp](https://github.com/ggml-org/llama.cpp) server. Nothing leaves the
-machine and there is no quota. It is optional, and the install scripts do not
-set it up -- without `llama-server` on `PATH` the plugin is skipped and the
-rest of the config is unaffected.
+[llama.cpp](https://github.com/ggml-org/llama.cpp) server: a model you run
+yourself, with no subscription and no quota.
+
+Neovim is only the client. When it starts, it asks the server at
+`NVIM_LLAMA_URL` (default `http://127.0.0.1:8012`) whether it is up and turns
+suggestions on if it answers. If nothing answers, suggestions stay off and that
+is all: Neovim does not start a server, download a model or use any memory
+unless you ask it to. The install scripts do not set any of this up.
+
+Where the server comes from is up to you:
+
+- __Start it yourself__, with whatever model and flags you like. Neovim picks
+  it up at its next start, or right away with `:LlamaConnect`.
+
+  ```sh
+  llama-server --fim-qwen-7b-default     # serves on 127.0.0.1:8012
+  ```
+
+- __`:LlamaServerStart`__ launches a local server in the background and
+  connects to it, for when you want suggestions now and none is running.
+- __`NVIM_LLAMA_AUTOSTART=1`__ does the same at every start, on machines where
+  you want it to just be there.
+- __Another machine__: point `NVIM_LLAMA_URL` at it, e.g.
+  `http://gpu-box:8012`. The server has to listen on an address this machine
+  can reach (`--host`), and the code around your cursor is sent to it, so keep
+  it on a network you trust. `--api-key` on the server plus
+  `NVIM_LLAMA_API_KEY` here adds a token.
+
+llama.cpp is only needed on the machine that runs the server:
 
 ```powershell
 winget install llama.cpp      # Windows
 brew install llama.cpp        # MacOS / Linux
 ```
 
-That is all. Neovim starts `llama-server` in the background the first time it
-is needed (`lua/config/llamaserver.lua`) and turns suggestions on once it
-answers. The very first start downloads the model (Qwen2.5-Coder 7B, ~8 GB)
-into the Hugging Face cache, so suggestions take a few minutes to appear; after
-that it is a few seconds. The server outlives Neovim so every instance shares
-one loaded model, and it unloads the model after 30 idle minutes.
+A server launched by Neovim runs Qwen2.5-Coder 7B: an ~8 GB download the first
+time, then about 9 GB of GPU memory while the model is loaded. It keeps running
+after Neovim exits, so every Neovim on the machine shares one copy and
+reopening the editor costs nothing. It unloads the model after 30 idle minutes
+(the next suggestion then takes about 15 seconds while it reloads), and
+`:LlamaServerStop` stops it outright.
 
 | Key | Action |
 | --- | --- |
@@ -164,24 +189,30 @@ one loaded model, and it unloads the model after 30 idle minutes.
 | `<M-w>` | accept the next word |
 | `<M-\>` | ask for a suggestion now |
 
-`:LlamaToggle` switches suggestions off and on for the session,
-`:LlamaServerStop` also kills the server to free its VRAM, and
-`:LlamaServerStart` brings it back. The server logs to `llama-server.log` in
-`:echo stdpath('state')`.
+| Command | Action |
+| --- | --- |
+| `:LlamaConnect` | turn suggestions on if the server answers; never starts one |
+| `:LlamaServerStart` | launch a local server unless one answers already, then connect |
+| `:LlamaServerStop` | turn suggestions off and stop the llama-server on the configured port |
+| `:LlamaToggle` | suggestions off and on for this session, without checking the server |
 
-Per-machine tuning stays out of the repo:
+Everything is set through environment variables, because all of it is per
+machine and this repo is shared between machines
+(`setx NVIM_LLAMA_AUTOSTART 1` on Windows, an `export` in your shell profile
+elsewhere):
 
-- **Opting out** -- the only check is whether `llama-server` is on `PATH`, not
-  whether the machine can run the model. On one that has llama.cpp installed
-  but no suitable GPU, set the environment variable `NVIM_NO_LLAMA=1` and the
-  plugin is skipped: no server is started and nothing is downloaded.
-- **Which GPU** -- with more than one (e.g. an eGPU next to an integrated one),
-  list them with `llama-server --list-devices` and set the environment variable
-  `LLAMA_ARG_DEVICE` to the one to use, e.g. `Vulkan0`.
-- **Which model** -- set `vim.g.llama_server_args` (a list of `llama-server`
-  arguments) before plugins load; the default is `--fim-qwen-7b-default`. Use
-  `--fim-qwen-3b-default` below 16 GB of VRAM, `--fim-qwen-1.5b-default` below
-  8 GB.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NVIM_LLAMA_URL` | `http://127.0.0.1:8012` | where the server is |
+| `NVIM_LLAMA_API_KEY` | unset | token for a server started with `--api-key` |
+| `NVIM_LLAMA_AUTOSTART` | off | `1` launches a local server at startup when none answers |
+| `NVIM_LLAMA_SERVER_ARGS` | `--fim-qwen-7b-default` | model arguments for a server Neovim launches |
+
+For a launched server, pick the model to fit the GPU: `--fim-qwen-3b-default`
+below 16 GB of VRAM, `--fim-qwen-1.5b-default` below 8 GB. With more than one
+GPU (e.g. an eGPU next to an integrated one), llama.cpp's own
+`LLAMA_ARG_DEVICE` selects which; `llama-server --list-devices` lists them. The
+server logs to `llama-server-<port>.log` in `:echo stdpath('state')`.
 
 ----
 

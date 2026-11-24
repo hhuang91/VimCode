@@ -1,33 +1,24 @@
--- Local inline completion: llama.vim talking to a llama.cpp server on this
--- machine. Replaces GitHub Copilot. See README, "Local AI completion".
-
-local function start()
-  require("config.llamaserver").ensure(function()
-    vim.fn["llama#enable"]()
-  end)
-end
+-- Inline completion from a llama.cpp server. llama.vim does the editing side;
+-- lua/config/llamaserver.lua knows where the server is and decides when to
+-- talk to it. Replaces GitHub Copilot. See README, "Local AI completion".
 
 return {
   {
     "ggml-org/llama.vim",
     event = "VeryLazy",
-    -- Machines without llama.cpp simply get no AI completion. `cond`, not
-    -- `enabled`, so the plugin keeps its lazy-lock.json pin either way.
-    --
-    -- NVIM_NO_LLAMA is the opt-out for a machine that has llama.cpp installed
-    -- but should not run a model from the editor (no GPU, too little VRAM).
-    -- An environment variable because it is per-machine and so cannot live in
-    -- this repo. Any value except empty or "0" counts.
+    -- llama.vim shells out to curl for every request and complains at startup
+    -- without it. `cond`, not `enabled`, so the plugin keeps its
+    -- lazy-lock.json pin either way.
     cond = function()
-      local off = vim.env.NVIM_NO_LLAMA
-      if off and off ~= "" and off ~= "0" then
-        return false
-      end
-      return vim.fn.executable("llama-server") == 1 and vim.fn.executable("curl") == 1
+      return vim.fn.executable("curl") == 1
     end,
     init = function()
+      local server = require("config.llamaserver")
       vim.g.llama_config = {
-        -- Turned on from `start()` once the server answers.
+        endpoint_fim = server.url .. "/infill",
+        endpoint_inst = server.url .. "/v1/chat/completions",
+        api_key = server.api_key or "",
+        -- Turned on from `config` below, and only once the server has answered.
         enable_at_startup = false,
         show_info = 0, -- no timing stats after the ghost text
 
@@ -64,6 +55,12 @@ return {
       vim.api.nvim_create_autocmd("ColorScheme", { callback = dim_hint })
     end,
     config = function()
+      local server = require("config.llamaserver")
+
+      local function enable()
+        vim.fn["llama#enable"]()
+      end
+
       -- LazyVim's blink.cmp <Tab> runs this after "accept the menu item" and
       -- before falling back to a literal tab.
       LazyVim.cmp.actions.ai_accept = function()
@@ -77,17 +74,24 @@ return {
         end
       end
 
-      vim.api.nvim_create_user_command("LlamaServerStart", start, {
-        desc = "Start the local llama.cpp server if needed, then enable llama.vim",
-      })
+      vim.api.nvim_create_user_command("LlamaConnect", function()
+        server.connect(enable)
+      end, { desc = "Turn suggestions on if the llama.cpp server at NVIM_LLAMA_URL answers" })
+      vim.api.nvim_create_user_command("LlamaServerStart", function()
+        server.start(enable)
+      end, { desc = "Launch a local llama.cpp server unless one answers already, then turn suggestions on" })
       vim.api.nvim_create_user_command("LlamaServerStop", function()
-        vim.fn["llama#disable"]()
-        require("config.llamaserver").stop()
-      end, { desc = "Disable llama.vim and stop the local llama.cpp server (frees its VRAM)" })
+        -- llama#disable() throws unless llama#enable() has run at some point.
+        if vim.fn.exists("#llama") == 1 then
+          vim.fn["llama#disable"]()
+        end
+        server.stop()
+      end, { desc = "Turn suggestions off and stop the local llama.cpp server, freeing its memory" })
 
-      -- Never from a headless run: scripts/install-* must not load a model.
+      -- Never from a headless run: scripts/install-* must not go looking for
+      -- a server, let alone launch one.
       if #vim.api.nvim_list_uis() > 0 then
-        start()
+        server.startup(enable)
       end
     end,
   },
